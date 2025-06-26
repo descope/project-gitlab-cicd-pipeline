@@ -40,6 +40,7 @@ The pipeline needs access tokens and project IDs to work with both GitLab and De
    - `MANAGEMENT_KEY` - Your Descope management key
    - `STAGING_PROJECT_ID` - Your staging Descope project ID
    - `PRODUCTION_PROJECT_ID` - Your production Descope project ID
+   <br/>
 
     <img src=".gitlab/images/cicd-variables.png" alt="CI\CD Variables">
 
