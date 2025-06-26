@@ -1,0 +1,186 @@
+# Main GitLab CI/CD Pipeline
+# Save as .gitlab-ci.yml
+
+variables:
+  FILES_PATH: 'ProjectSnapshot'
+  BRANCH_NAME: 'descope/update-snapshot-${CI_PIPELINE_ID}'
+
+stages:
+  - create_merge_req_from_staging
+  - deploy_to_production
+
+# ==========================================
+# STAGE 1: Manual Export and Create MR
+# ==========================================
+
+export_and_create_mr:
+  stage: create_merge_req_from_staging
+  image: ubuntu:latest
+  variables:
+    MERGE_REQUEST_TITLE: 'Update snapshot from staging project'
+    MERGE_REQUEST_BODY: |
+      ### Description
+      Snapshot exported from staging project.
+      
+      ### Changes
+      CHANGES_LIST
+  before_script:
+    # Install required tools
+    - apt-get update && apt-get install -y git curl jq wget gnupg
+    # Install GitLab CLI (glab)
+    - |
+      GLAB_VERSION=$(curl -s "https://api.github.com/repos/profclems/glab/releases/latest" | jq -r '.tag_name')
+      wget -O glab.tar.gz "https://github.com/profclems/glab/releases/download/${GLAB_VERSION}/glab_${GLAB_VERSION#v}_Linux_x86_64.tar.gz"
+      tar -xzf glab.tar.gz
+      mv bin/glab /usr/local/bin/
+      chmod +x /usr/local/bin/glab
+  script:
+    - |
+      # Configure git
+      git config --global user.email "${GITLAB_USER_EMAIL:-$GITLAB_USER_ID+$GITLAB_USER_LOGIN@users.noreply.gitlab.com}"
+      git config --global user.name "${GITLAB_USER_NAME:-$GITLAB_USER_LOGIN}"
+      
+      # Clone repository
+      git clone "https://oauth2:${GITLAB_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" repo
+      cd repo
+      git checkout -b "$BRANCH_NAME"
+      
+      # Install Descope CLI
+      apt-key adv --keyserver keyserver.ubuntu.com --recv-keys e8365d8513142909
+      echo "deb https://descope.github.io/packages stable main" | tee /etc/apt/sources.list.d/descope.list
+      apt-get update
+      apt-get install -y descope
+      
+      # Export snapshot
+      mkdir -p "$FILES_PATH"
+      export DESCOPE_MANAGEMENT_KEY=$MANAGEMENT_KEY
+      descope project snapshot export "$STAGING_PROJECT_ID" --path "$FILES_PATH"
+      
+      # Check for changes
+      if [ -z "$(git status --porcelain "$FILES_PATH")" ]; then
+        echo "No changes detected - exiting"
+        exit 0
+      fi
+      
+      # Create changes list
+      CHANGES_FILE=$(mktemp)
+      FORMATTED_CHANGES=$(mktemp)
+      git status --porcelain "$FILES_PATH" | cut -c4- > "$CHANGES_FILE"
+      while read -r line; do 
+        echo "- \`${line#$FILES_PATH/}\`" >> "$FORMATTED_CHANGES"
+      done < "$CHANGES_FILE"
+      
+      # Create MR body
+      BODY_FILE=$(mktemp)
+      echo "$MERGE_REQUEST_BODY" | sed -e "/CHANGES_LIST/r $FORMATTED_CHANGES" -e "//d" > "$BODY_FILE"
+      
+      # Commit and push
+      git add .
+      git commit -m "$MERGE_REQUEST_TITLE"
+      git push origin "$BRANCH_NAME"
+      
+      # Create merge request via API
+      MR_RESPONSE=$(curl -s -X POST \
+        -H "PRIVATE-TOKEN: $GITLAB_PUSH_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "{
+          \"source_branch\": \"$BRANCH_NAME\",
+          \"target_branch\": \"$CI_DEFAULT_BRANCH\",
+          \"title\": \"$MERGE_REQUEST_TITLE\",
+          \"description\": $(cat $BODY_FILE | jq -Rs .),
+          \"assignee_id\": \"$GITLAB_USER_ID\",
+          \"remove_source_branch\": true
+        }" \
+        "https://$CI_SERVER_HOST/api/v4/projects/$CI_PROJECT_ID/merge_requests")
+      
+      MR_URL=$(echo "$MR_RESPONSE" | jq -r '.web_url // empty')
+      if [ -n "$MR_URL" ]; then
+        echo "Merge request created: $MR_URL"
+      else
+        echo "Failed to create MR: $MR_RESPONSE"
+        exit 1
+      fi
+  rules:
+    # Only run when manually triggered
+    - if: '$CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "trigger"'
+      when: manual
+
+# ==========================================
+# STAGE 2: Auto Deploy After Merge
+# ==========================================
+
+validate_and_deploy:
+  stage: deploy_to_production
+  image: ubuntu:latest
+  before_script:
+    # Install Descope CLI
+    - apt-get update && apt-get install -y curl jq gnupg git
+    - |
+      apt-key adv --keyserver keyserver.ubuntu.com --recv-keys e8365d8513142909
+      echo "deb https://descope.github.io/packages stable main" | tee /etc/apt/sources.list.d/descope.list
+      apt-get update
+      apt-get install -y descope
+  script:
+    - |
+      echo "=== Checking for meaningful ProjectSnapshot changes ==="
+      
+      # Check if ProjectSnapshot directory exists
+      if [ ! -d "$FILES_PATH" ]; then
+        echo "No ProjectSnapshot directory found - skipping deployment"
+        exit 0
+      fi
+      
+      echo "Current commit: $CI_COMMIT_SHA"
+      echo "Commit message: $CI_COMMIT_MESSAGE"
+      
+      # Get the previous commit (before this merge)
+      PREVIOUS_COMMIT=$(git rev-parse HEAD~1)
+      echo "Previous commit: $PREVIOUS_COMMIT"
+      
+      # Check if there are actual content differences in ProjectSnapshot between commits
+      if git diff --quiet $PREVIOUS_COMMIT HEAD -- "$FILES_PATH"; then
+        echo "No actual content changes detected in ProjectSnapshot between commits"
+        echo "Checking if this might be a revert or identical content..."
+        
+        # Show what files were touched (even if content is same)
+        TOUCHED_FILES=$(git diff --name-only $PREVIOUS_COMMIT HEAD -- "$FILES_PATH")
+        if [ -n "$TOUCHED_FILES" ]; then
+          echo "Files were touched but content is identical:"
+          echo "$TOUCHED_FILES"
+          echo "This appears to be a revert or duplicate change - skipping deployment"
+        else
+          echo "No files in ProjectSnapshot were modified at all"
+        fi
+        
+        exit 0
+      fi
+      
+      echo "=== Meaningful ProjectSnapshot changes detected ==="
+      echo "Files with actual content changes:"
+      git diff --name-only $PREVIOUS_COMMIT HEAD -- "$FILES_PATH"
+      
+      echo "=== Summary of changes ==="
+      git diff --stat $PREVIOUS_COMMIT HEAD -- "$FILES_PATH"
+      
+      echo "=== Validating Snapshot ==="
+      export DESCOPE_MANAGEMENT_KEY=$MANAGEMENT_KEY
+      descope project snapshot validate "$PRODUCTION_PROJECT_ID" --path "$FILES_PATH"
+      echo "Validation completed successfully"
+      
+      echo "=== Deploying to Production ==="
+      descope project snapshot import "$PRODUCTION_PROJECT_ID" --path "$FILES_PATH"
+      echo "Production deployment completed successfully"
+  rules:
+    # Only run on main branch when it's a push (merge) - NOT on manual pipeline triggers
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
+      when: always
+    # Never run on manual pipeline triggers or other sources
+    - when: never
+
+# ==========================================
+# Required GitLab CI/CD Variables
+# ==========================================
+# - STAGING_PROJECT_ID: Your Descope staging project ID
+# - MANAGEMENT_KEY: Your Descope management key (protected/masked)
+# - PRODUCTION_PROJECT_ID: Your Descope production project ID
+# - GITLAB_PUSH_TOKEN: Personal Access Token with write_repository scope
