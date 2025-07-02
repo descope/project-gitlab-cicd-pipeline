@@ -1,0 +1,42 @@
+name: Validate GitLab CI
+
+on:
+  push:
+    paths: ['.gitlab-ci.yml']
+  pull_request:
+    paths: ['.gitlab-ci.yml']
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Validate
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        run: |
+          set -e
+          
+          INPUT=$(cat .gitlab-ci.yml)
+          
+          RESPONSE=$(
+            jq --null-input --arg yaml "$INPUT" '.content=$yaml' \
+             | curl -s "https://gitlab.com/api/v4/ci/lint" \
+                --header 'Content-Type: application/json' \
+                --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+                --data @-
+          )
+          
+          echo "$RESPONSE" | jq '.'
+          
+          STATUS=$(echo "$RESPONSE" | jq -r '.status')
+          
+          if [[ $STATUS == 'valid' ]]; then
+              exit 0
+          elif [[ $STATUS == 'invalid' ]]; then
+              exit 1
+          else
+              exit 2
+          fi
