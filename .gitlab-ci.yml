@@ -83,10 +83,11 @@ export_and_create_mr:
       ### Changes
       CHANGES_LIST
   before_script:
+    # Validate configuration before spending time on installs.
+    - !reference [.snippets, check_required_vars]
     # Install required tools
     - apt-get update && apt-get install -y git curl jq
   script:
-    - !reference [.snippets, check_required_vars]
     - |
       # Configure git
       git config --global user.email "${GITLAB_USER_EMAIL:-$GITLAB_USER_ID+$GITLAB_USER_LOGIN@users.noreply.gitlab.com}"
@@ -165,12 +166,17 @@ validate_and_deploy:
   stage: deploy_to_production
   variables:
     REQUIRED_VARS: 'MANAGEMENT_KEY PRODUCTION_PROJECT_ID'
+    # This job diffs HEAD against its parent to decide whether to deploy, so the
+    # parent commit must be in the clone. GitLab's default shallow clone does not
+    # guarantee it; depth 2 does, up front, with no runtime fetching.
+    GIT_DEPTH: 2
   before_script:
+    # Validate configuration before spending time on installs.
+    - !reference [.snippets, check_required_vars]
     # Install required tools
     - apt-get update && apt-get install -y curl jq git
     - !reference [.snippets, install_descope_cli]
   script:
-    - !reference [.snippets, check_required_vars]
     - |
       echo "=== Checking for meaningful ProjectSnapshot changes ==="
 
@@ -183,12 +189,8 @@ validate_and_deploy:
       echo "Current commit: $CI_COMMIT_SHA"
       echo "Commit message: $CI_COMMIT_MESSAGE"
       
-      # Get the previous commit (before this merge). GitLab clones shallowly by
-      # default (GIT_DEPTH), so HEAD~1 is not guaranteed to be present.
-      if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
-        git fetch --deepen=1 || true
-      fi
-
+      # Get the previous commit (before this merge). GIT_DEPTH: 2 above guarantees
+      # it is present, except on a genuine initial commit (no parent exists).
       if PREVIOUS_COMMIT=$(git rev-parse --verify -q HEAD~1); then
         echo "Previous commit: $PREVIOUS_COMMIT"
 
@@ -217,8 +219,8 @@ validate_and_deploy:
         echo "=== Summary of changes ==="
         git diff --stat $PREVIOUS_COMMIT HEAD -- "$FILES_PATH"
       else
-        echo "No previous commit available (initial commit or shallow clone)"
-        echo "Cannot diff - proceeding with deployment"
+        echo "HEAD has no parent (initial commit) - nothing to diff against"
+        echo "Proceeding with deployment"
       fi
 
       echo "=== Validating Snapshot ==="
