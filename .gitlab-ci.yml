@@ -14,32 +14,35 @@ stages:
   - deploy_to_production
 
 # ==========================================
-# STAGE 1: Manual Export and Create MR
+# Shared definitions
 # ==========================================
 
-export_and_create_mr:
-  stage: create_merge_req_from_staging
-  # Pinned deliberately: 'ubuntu:latest' moves between LTS releases and has
-  # broken this pipeline before (24.04 removed apt-key). Bump this on purpose.
+# Base image for every job. Pinned deliberately: 'ubuntu:latest' moves between
+# LTS releases and has broken this pipeline before (24.04 removed apt-key).
+# Bump this on purpose, in one place.
+.descope_base:
   image: ubuntu:24.04
-  variables:
-    MERGE_REQUEST_TITLE: 'Update snapshot from staging project'
-    MERGE_REQUEST_BODY: |
-      ### Description
-      Snapshot exported from staging project.
-      
-      ### Changes
-      CHANGES_LIST
-  before_script:
-    # Install required tools
-    - apt-get update && apt-get install -y git curl jq
-  script:
+
+# Reusable script snippets, pulled into jobs with !reference so there is a
+# single copy of each. Hidden jobs are never executed on their own.
+.snippets:
+  # Fail fast with a clear message if a required variable is missing or empty.
+  # The usual cause is a "Protected" CI/CD variable on an unprotected branch,
+  # which GitLab silently omits from the job environment.
+  # Reads the space-separated variable names from $REQUIRED_VARS, which each
+  # job sets in its own `variables:` block.
+  check_required_vars:
     - |
-      # Fail fast with a clear message if a required variable is missing or empty.
-      # The usual cause is a "Protected" CI/CD variable on an unprotected branch,
-      # which GitLab silently omits from the job environment.
+      if [ -z "${REQUIRED_VARS:-}" ]; then
+        echo "ERROR: this job references .snippets:check_required_vars but does not"
+        echo "set REQUIRED_VARS, so nothing would be checked. Add it to the job's"
+        echo "'variables:' block as a space-separated list of variable names."
+        exit 1
+      fi
+
       MISSING=""
-      for VAR in GITLAB_PUSH_TOKEN MANAGEMENT_KEY STAGING_PROJECT_ID; do
+      # Intentionally unquoted: $REQUIRED_VARS is a space-separated name list.
+      for VAR in $REQUIRED_VARS; do
         eval "VALUE=\${$VAR:-}"
         if [ -z "$VALUE" ]; then
           MISSING="$MISSING $VAR"
@@ -53,22 +56,50 @@ export_and_create_mr:
         exit 1
       fi
 
-      # Configure git
-      git config --global user.email "${GITLAB_USER_EMAIL:-$GITLAB_USER_ID+$GITLAB_USER_LOGIN@users.noreply.gitlab.com}"
-      git config --global user.name "${GITLAB_USER_NAME:-$GITLAB_USER_LOGIN}"
-      
-      # Clone repository
-      git clone "https://oauth2:${GITLAB_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" repo
-      cd repo
-      git checkout -b "$BRANCH_NAME"
-      
-      # Install Descope CLI
+  # Adds the Descope apt repository and installs the CLI.
+  # Requires curl to already be installed.
+  install_descope_cli:
+    - |
       mkdir -p /etc/apt/keyrings
       curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xe8365d8513142909" -o /etc/apt/keyrings/descope.asc
       echo "deb [signed-by=/etc/apt/keyrings/descope.asc] https://descope.github.io/packages stable main" | tee /etc/apt/sources.list.d/descope.list
       apt-get update
       apt-get install -y descope
+
+# ==========================================
+# STAGE 1: Manual Export and Create MR
+# ==========================================
+
+export_and_create_mr:
+  extends: .descope_base
+  stage: create_merge_req_from_staging
+  variables:
+    REQUIRED_VARS: 'GITLAB_PUSH_TOKEN MANAGEMENT_KEY STAGING_PROJECT_ID'
+    MERGE_REQUEST_TITLE: 'Update snapshot from staging project'
+    MERGE_REQUEST_BODY: |
+      ### Description
+      Snapshot exported from staging project.
       
+      ### Changes
+      CHANGES_LIST
+  before_script:
+    # Install required tools
+    - apt-get update && apt-get install -y git curl jq
+  script:
+    - !reference [.snippets, check_required_vars]
+    - |
+      # Configure git
+      git config --global user.email "${GITLAB_USER_EMAIL:-$GITLAB_USER_ID+$GITLAB_USER_LOGIN@users.noreply.gitlab.com}"
+      git config --global user.name "${GITLAB_USER_NAME:-$GITLAB_USER_LOGIN}"
+
+      # Clone repository
+      git clone "https://oauth2:${GITLAB_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" repo
+      cd repo
+      git checkout -b "$BRANCH_NAME"
+    # All script entries share one shell, so the working directory set above
+    # (repo/) still applies to the snippet below and to the rest of the script.
+    - !reference [.snippets, install_descope_cli]
+    - |
       # Export snapshot
       mkdir -p "$FILES_PATH"
       export DESCOPE_MANAGEMENT_KEY=$MANAGEMENT_KEY
@@ -130,39 +161,17 @@ export_and_create_mr:
 # ==========================================
 
 validate_and_deploy:
+  extends: .descope_base
   stage: deploy_to_production
-  # Pinned deliberately: 'ubuntu:latest' moves between LTS releases and has
-  # broken this pipeline before (24.04 removed apt-key). Bump this on purpose.
-  image: ubuntu:24.04
+  variables:
+    REQUIRED_VARS: 'MANAGEMENT_KEY PRODUCTION_PROJECT_ID'
   before_script:
-    # Install Descope CLI
+    # Install required tools
     - apt-get update && apt-get install -y curl jq git
-    - |
-      mkdir -p /etc/apt/keyrings
-      curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xe8365d8513142909" -o /etc/apt/keyrings/descope.asc
-      echo "deb [signed-by=/etc/apt/keyrings/descope.asc] https://descope.github.io/packages stable main" | tee /etc/apt/sources.list.d/descope.list
-      apt-get update
-      apt-get install -y descope
+    - !reference [.snippets, install_descope_cli]
   script:
+    - !reference [.snippets, check_required_vars]
     - |
-      # Fail fast with a clear message if a required variable is missing or empty.
-      # The usual cause is a "Protected" CI/CD variable on an unprotected branch,
-      # which GitLab silently omits from the job environment.
-      MISSING=""
-      for VAR in MANAGEMENT_KEY PRODUCTION_PROJECT_ID; do
-        eval "VALUE=\${$VAR:-}"
-        if [ -z "$VALUE" ]; then
-          MISSING="$MISSING $VAR"
-        fi
-      done
-      if [ -n "$MISSING" ]; then
-        echo "ERROR: missing or empty CI/CD variable(s):$MISSING"
-        echo "Set them in Settings -> CI/CD -> Variables."
-        echo "If they are already set, check that they are not marked 'Protected'"
-        echo "while this pipeline runs on an unprotected branch ($CI_COMMIT_REF_NAME)."
-        exit 1
-      fi
-
       echo "=== Checking for meaningful ProjectSnapshot changes ==="
 
       # Check if ProjectSnapshot directory exists
