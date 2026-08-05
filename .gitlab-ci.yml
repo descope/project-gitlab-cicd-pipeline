@@ -4,9 +4,10 @@
 variables:
   FILES_PATH: 'ProjectSnapshot'
   BRANCH_NAME: 'descope/update-snapshot-${CI_PIPELINE_ID}'
-  # Optional: override the Descope API base URL (e.g. for the EU region or a
-  # dedicated environment). Leave empty to use the CLI default.
-  DESCOPE_BASE_URL: ''
+  # DESCOPE_BASE_URL is intentionally not declared here. Define it as a CI/CD
+  # variable to override the Descope API base URL (e.g. for the EU region);
+  # leaving it undeclared keeps it absent from the job env so the CLI uses its
+  # own default rather than receiving an empty value.
 
 stages:
   - create_merge_req_from_staging
@@ -57,11 +58,8 @@ export_and_create_mr:
       # Export snapshot
       mkdir -p "$FILES_PATH"
       export DESCOPE_MANAGEMENT_KEY=$MANAGEMENT_KEY
-      # Optional: point the CLI at a non-default Descope region/environment
-      if [ -n "$DESCOPE_BASE_URL" ]; then
-        export DESCOPE_BASE_URL
-        echo "Using Descope base URL: $DESCOPE_BASE_URL"
-      fi
+      # DESCOPE_BASE_URL, if set as a CI/CD variable, is already in the job env
+      if [ -n "$DESCOPE_BASE_URL" ]; then echo "Using Descope base URL: $DESCOPE_BASE_URL"; fi
       descope project snapshot export "$STAGING_PROJECT_ID" --path "$FILES_PATH"
       
       # Check for changes
@@ -172,11 +170,8 @@ validate_and_deploy:
       
       echo "=== Validating Snapshot ==="
       export DESCOPE_MANAGEMENT_KEY=$MANAGEMENT_KEY
-      # Optional: point the CLI at a non-default Descope region/environment
-      if [ -n "$DESCOPE_BASE_URL" ]; then
-        export DESCOPE_BASE_URL
-        echo "Using Descope base URL: $DESCOPE_BASE_URL"
-      fi
+      # DESCOPE_BASE_URL, if set as a CI/CD variable, is already in the job env
+      if [ -n "$DESCOPE_BASE_URL" ]; then echo "Using Descope base URL: $DESCOPE_BASE_URL"; fi
       descope project snapshot validate "$PRODUCTION_PROJECT_ID" --path "$FILES_PATH"
       echo "Validation completed successfully"
       
