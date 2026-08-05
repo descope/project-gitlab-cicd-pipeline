@@ -4,19 +4,77 @@
 variables:
   FILES_PATH: 'ProjectSnapshot'
   BRANCH_NAME: 'descope/update-snapshot-${CI_PIPELINE_ID}'
+  # DESCOPE_BASE_URL is intentionally not declared here. Define it as a CI/CD
+  # variable to override the Descope API base URL (e.g. for the EU region);
+  # leaving it undeclared keeps it absent from the job env so the CLI uses its
+  # own default rather than receiving an empty value.
 
 stages:
   - create_merge_req_from_staging
   - deploy_to_production
 
 # ==========================================
+# Shared definitions
+# ==========================================
+
+# Base image for every job. Pinned deliberately: 'ubuntu:latest' moves between
+# LTS releases and has broken this pipeline before (24.04 removed apt-key).
+# Bump this on purpose, in one place.
+.descope_base:
+  image: ubuntu:24.04
+
+# Reusable script snippets, pulled into jobs with !reference so there is a
+# single copy of each. Hidden jobs are never executed on their own.
+.snippets:
+  # Fail fast with a clear message if a required variable is missing or empty.
+  # The usual cause is a "Protected" CI/CD variable on an unprotected branch,
+  # which GitLab silently omits from the job environment.
+  # Reads the space-separated variable names from $REQUIRED_VARS, which each
+  # job sets in its own `variables:` block.
+  check_required_vars:
+    - |
+      if [ -z "${REQUIRED_VARS:-}" ]; then
+        echo "ERROR: this job references .snippets:check_required_vars but does not"
+        echo "set REQUIRED_VARS, so nothing would be checked. Add it to the job's"
+        echo "'variables:' block as a space-separated list of variable names."
+        exit 1
+      fi
+
+      MISSING=""
+      # Intentionally unquoted: $REQUIRED_VARS is a space-separated name list.
+      for VAR in $REQUIRED_VARS; do
+        eval "VALUE=\${$VAR:-}"
+        if [ -z "$VALUE" ]; then
+          MISSING="$MISSING $VAR"
+        fi
+      done
+      if [ -n "$MISSING" ]; then
+        echo "ERROR: missing or empty CI/CD variable(s):$MISSING"
+        echo "Set them in Settings -> CI/CD -> Variables."
+        echo "If they are already set, check that they are not marked 'Protected'"
+        echo "while this pipeline runs on an unprotected branch ($CI_COMMIT_REF_NAME)."
+        exit 1
+      fi
+
+  # Adds the Descope apt repository and installs the CLI.
+  # Requires curl to already be installed.
+  install_descope_cli:
+    - |
+      mkdir -p /etc/apt/keyrings
+      curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xe8365d8513142909" -o /etc/apt/keyrings/descope.asc
+      echo "deb [signed-by=/etc/apt/keyrings/descope.asc] https://descope.github.io/packages stable main" | tee /etc/apt/sources.list.d/descope.list
+      apt-get update
+      apt-get install -y descope
+
+# ==========================================
 # STAGE 1: Manual Export and Create MR
 # ==========================================
 
 export_and_create_mr:
+  extends: .descope_base
   stage: create_merge_req_from_staging
-  image: ubuntu:latest
   variables:
+    REQUIRED_VARS: 'GITLAB_PUSH_TOKEN MANAGEMENT_KEY STAGING_PROJECT_ID'
     MERGE_REQUEST_TITLE: 'Update snapshot from staging project'
     MERGE_REQUEST_BODY: |
       ### Description
@@ -25,35 +83,29 @@ export_and_create_mr:
       ### Changes
       CHANGES_LIST
   before_script:
+    # Validate configuration before spending time on installs.
+    - !reference [.snippets, check_required_vars]
     # Install required tools
-    - apt-get update && apt-get install -y git curl jq wget gnupg
-    # Install GitLab CLI (glab)
-    - |
-      GLAB_VERSION=$(curl -s "https://api.github.com/repos/profclems/glab/releases/latest" | jq -r '.tag_name')
-      wget -O glab.tar.gz "https://github.com/profclems/glab/releases/download/${GLAB_VERSION}/glab_${GLAB_VERSION#v}_Linux_x86_64.tar.gz"
-      tar -xzf glab.tar.gz
-      mv bin/glab /usr/local/bin/
-      chmod +x /usr/local/bin/glab
+    - apt-get update && apt-get install -y git curl jq
   script:
     - |
       # Configure git
       git config --global user.email "${GITLAB_USER_EMAIL:-$GITLAB_USER_ID+$GITLAB_USER_LOGIN@users.noreply.gitlab.com}"
       git config --global user.name "${GITLAB_USER_NAME:-$GITLAB_USER_LOGIN}"
-      
+
       # Clone repository
       git clone "https://oauth2:${GITLAB_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" repo
       cd repo
       git checkout -b "$BRANCH_NAME"
-      
-      # Install Descope CLI
-      apt-key adv --keyserver keyserver.ubuntu.com --recv-keys e8365d8513142909
-      echo "deb https://descope.github.io/packages stable main" | tee /etc/apt/sources.list.d/descope.list
-      apt-get update
-      apt-get install -y descope
-      
+    # All script entries share one shell, so the working directory set above
+    # (repo/) still applies to the snippet below and to the rest of the script.
+    - !reference [.snippets, install_descope_cli]
+    - |
       # Export snapshot
       mkdir -p "$FILES_PATH"
       export DESCOPE_MANAGEMENT_KEY=$MANAGEMENT_KEY
+      # DESCOPE_BASE_URL, if set as a CI/CD variable, is already in the job env
+      if [ -n "$DESCOPE_BASE_URL" ]; then echo "Using Descope base URL: $DESCOPE_BASE_URL"; fi
       descope project snapshot export "$STAGING_PROJECT_ID" --path "$FILES_PATH"
       
       # Check for changes
@@ -110,20 +162,24 @@ export_and_create_mr:
 # ==========================================
 
 validate_and_deploy:
+  extends: .descope_base
   stage: deploy_to_production
-  image: ubuntu:latest
+  variables:
+    REQUIRED_VARS: 'MANAGEMENT_KEY PRODUCTION_PROJECT_ID'
+    # This job diffs HEAD against its parent to decide whether to deploy, so the
+    # parent commit must be in the clone. GitLab's default shallow clone does not
+    # guarantee it; depth 2 does, up front, with no runtime fetching.
+    GIT_DEPTH: 2
   before_script:
-    # Install Descope CLI
-    - apt-get update && apt-get install -y curl jq gnupg git
-    - |
-      apt-key adv --keyserver keyserver.ubuntu.com --recv-keys e8365d8513142909
-      echo "deb https://descope.github.io/packages stable main" | tee /etc/apt/sources.list.d/descope.list
-      apt-get update
-      apt-get install -y descope
+    # Validate configuration before spending time on installs.
+    - !reference [.snippets, check_required_vars]
+    # Install required tools
+    - apt-get update && apt-get install -y curl jq git
+    - !reference [.snippets, install_descope_cli]
   script:
     - |
       echo "=== Checking for meaningful ProjectSnapshot changes ==="
-      
+
       # Check if ProjectSnapshot directory exists
       if [ ! -d "$FILES_PATH" ]; then
         echo "No ProjectSnapshot directory found - skipping deployment"
@@ -133,37 +189,44 @@ validate_and_deploy:
       echo "Current commit: $CI_COMMIT_SHA"
       echo "Commit message: $CI_COMMIT_MESSAGE"
       
-      # Get the previous commit (before this merge)
-      PREVIOUS_COMMIT=$(git rev-parse HEAD~1)
-      echo "Previous commit: $PREVIOUS_COMMIT"
-      
-      # Check if there are actual content differences in ProjectSnapshot between commits
-      if git diff --quiet $PREVIOUS_COMMIT HEAD -- "$FILES_PATH"; then
-        echo "No actual content changes detected in ProjectSnapshot between commits"
-        echo "Checking if this might be a revert or identical content..."
-        
-        # Show what files were touched (even if content is same)
-        TOUCHED_FILES=$(git diff --name-only $PREVIOUS_COMMIT HEAD -- "$FILES_PATH")
-        if [ -n "$TOUCHED_FILES" ]; then
-          echo "Files were touched but content is identical:"
-          echo "$TOUCHED_FILES"
-          echo "This appears to be a revert or duplicate change - skipping deployment"
-        else
-          echo "No files in ProjectSnapshot were modified at all"
+      # Get the previous commit (before this merge). GIT_DEPTH: 2 above guarantees
+      # it is present, except on a genuine initial commit (no parent exists).
+      if PREVIOUS_COMMIT=$(git rev-parse --verify -q HEAD~1); then
+        echo "Previous commit: $PREVIOUS_COMMIT"
+
+        # Check if there are actual content differences in ProjectSnapshot between commits
+        if git diff --quiet $PREVIOUS_COMMIT HEAD -- "$FILES_PATH"; then
+          echo "No actual content changes detected in ProjectSnapshot between commits"
+          echo "Checking if this might be a revert or identical content..."
+
+          # Show what files were touched (even if content is same)
+          TOUCHED_FILES=$(git diff --name-only $PREVIOUS_COMMIT HEAD -- "$FILES_PATH")
+          if [ -n "$TOUCHED_FILES" ]; then
+            echo "Files were touched but content is identical:"
+            echo "$TOUCHED_FILES"
+            echo "This appears to be a revert or duplicate change - skipping deployment"
+          else
+            echo "No files in ProjectSnapshot were modified at all"
+          fi
+
+          exit 0
         fi
-        
-        exit 0
+
+        echo "=== Meaningful ProjectSnapshot changes detected ==="
+        echo "Files with actual content changes:"
+        git diff --name-only $PREVIOUS_COMMIT HEAD -- "$FILES_PATH"
+
+        echo "=== Summary of changes ==="
+        git diff --stat $PREVIOUS_COMMIT HEAD -- "$FILES_PATH"
+      else
+        echo "HEAD has no parent (initial commit) - nothing to diff against"
+        echo "Proceeding with deployment"
       fi
-      
-      echo "=== Meaningful ProjectSnapshot changes detected ==="
-      echo "Files with actual content changes:"
-      git diff --name-only $PREVIOUS_COMMIT HEAD -- "$FILES_PATH"
-      
-      echo "=== Summary of changes ==="
-      git diff --stat $PREVIOUS_COMMIT HEAD -- "$FILES_PATH"
-      
+
       echo "=== Validating Snapshot ==="
       export DESCOPE_MANAGEMENT_KEY=$MANAGEMENT_KEY
+      # DESCOPE_BASE_URL, if set as a CI/CD variable, is already in the job env
+      if [ -n "$DESCOPE_BASE_URL" ]; then echo "Using Descope base URL: $DESCOPE_BASE_URL"; fi
       descope project snapshot validate "$PRODUCTION_PROJECT_ID" --path "$FILES_PATH"
       echo "Validation completed successfully"
       
@@ -183,4 +246,9 @@ validate_and_deploy:
 # - STAGING_PROJECT_ID: Your Descope staging project ID
 # - MANAGEMENT_KEY: Your Descope management key (protected/masked)
 # - PRODUCTION_PROJECT_ID: Your Descope production project ID
-# - GITLAB_PUSH_TOKEN: Personal Access Token with write_repository scope
+# - GITLAB_PUSH_TOKEN: Access token with the api, read_repository and write_repository
+#                      scopes, and the Developer role (or higher)
+#
+# Optional:
+# - DESCOPE_BASE_URL: Descope API base URL, if not using the default US region
+#                     (e.g. https://api.euc1.descope.com for the EU region)
