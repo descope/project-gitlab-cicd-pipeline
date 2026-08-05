@@ -34,13 +34,14 @@ You can use this pipeline to:
 
 The pipeline needs access tokens and project IDs to work with both GitLab and Descope APIs.
 
-1. Create a **Project Access Token** (preferred) in **Settings → Access Tokens** or **Personal Access Token** in **User Settings → Access Tokens** with `write_repository` and `api` scopes.
-2. In your project's **Settings → CI/CD → Variables**, add these variables:
+1. Create a new GitLab project.
+2. Create a **Project Access Token** (preferred) in **Settings → Access Tokens** or **Personal Access Token** in **User Settings → Access Tokens** with `write_repository` and `api` scopes.
+3. In your project's **Settings → CI/CD → Variables**, add these variables:
    - `GITLAB_PUSH_TOKEN` - Your Personal Access Token
    - `MANAGEMENT_KEY` - Your Descope management key
    - `STAGING_PROJECT_ID` - Your staging Descope project ID
    - `PRODUCTION_PROJECT_ID` - Your production Descope project ID
-3. Optionally, add a `DESCOPE_BASE_URL` variable if your projects are not in the default US region or live in a dedicated environment (for example `https://api.euc1.descope.com` for the EU region). When it's not set, the Descope CLI uses its default base URL.
+4. Optionally, add a `DESCOPE_BASE_URL` variable if your projects are not in the default US region or live in a dedicated environment (for example `https://api.euc1.descope.com` for the EU region). When it's not set, the Descope CLI uses its default base URL.
    <br/>
 
     <img src=".gitlab/images/cicd-variables.png" alt="CI\CD Variables">
@@ -49,8 +50,8 @@ The pipeline needs access tokens and project IDs to work with both GitLab and De
 
 ## Usage
 
-1. Create a new Gitlab project.
-2. Click **Build → Pipeline editor** and select **Configure pipeline**.
+1. Enter your newly created GitLab project.
+2. Click **Build → Pipeline editor** and select **Start building**.
 3. Copy the content of the `.gitlab-ci.yml` file to the text editor and commit the change.
 4. A `validate_and_deploy` job will automatically run without changes. At first, the repository will be empty (Except the `.gitlab-ci.yml` file). We'll want to get the current state of the Descope project into the repository.
 5. Go to **Build → Pipelines** in your GitLab project.
