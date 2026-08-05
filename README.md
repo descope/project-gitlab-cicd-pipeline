@@ -42,6 +42,8 @@ The pipeline needs access tokens and project IDs to work with both GitLab and De
    - `MANAGEMENT_KEY` - Your Descope management key
    - `STAGING_PROJECT_ID` - Your staging Descope project ID
    - `PRODUCTION_PROJECT_ID` - Your production Descope project ID
+
+   > **Note:** If you mark any of these variables as **Protected**, they are only passed to pipelines running on protected branches. On any other branch GitLab omits them silently and the job fails with a missing-variable error.
 4. Optionally, add a `DESCOPE_BASE_URL` variable if your projects are not in the default US region or live in a dedicated environment (for example `https://api.euc1.descope.com` for the EU region). When it's not set, the Descope CLI uses its default base URL.
    <br/>
 

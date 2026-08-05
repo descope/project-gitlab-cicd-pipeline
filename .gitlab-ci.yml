@@ -19,7 +19,9 @@ stages:
 
 export_and_create_mr:
   stage: create_merge_req_from_staging
-  image: ubuntu:latest
+  # Pinned deliberately: 'ubuntu:latest' moves between LTS releases and has
+  # broken this pipeline before (24.04 removed apt-key). Bump this on purpose.
+  image: ubuntu:24.04
   variables:
     MERGE_REQUEST_TITLE: 'Update snapshot from staging project'
     MERGE_REQUEST_BODY: |
@@ -30,16 +32,27 @@ export_and_create_mr:
       CHANGES_LIST
   before_script:
     # Install required tools
-    - apt-get update && apt-get install -y git curl jq wget gnupg
-    # Install GitLab CLI (glab)
-    - |
-      GLAB_VERSION=$(curl -s "https://api.github.com/repos/profclems/glab/releases/latest" | jq -r '.tag_name')
-      wget -O glab.tar.gz "https://github.com/profclems/glab/releases/download/${GLAB_VERSION}/glab_${GLAB_VERSION#v}_Linux_x86_64.tar.gz"
-      tar -xzf glab.tar.gz
-      mv bin/glab /usr/local/bin/
-      chmod +x /usr/local/bin/glab
+    - apt-get update && apt-get install -y git curl jq
   script:
     - |
+      # Fail fast with a clear message if a required variable is missing or empty.
+      # The usual cause is a "Protected" CI/CD variable on an unprotected branch,
+      # which GitLab silently omits from the job environment.
+      MISSING=""
+      for VAR in GITLAB_PUSH_TOKEN MANAGEMENT_KEY STAGING_PROJECT_ID; do
+        eval "VALUE=\${$VAR:-}"
+        if [ -z "$VALUE" ]; then
+          MISSING="$MISSING $VAR"
+        fi
+      done
+      if [ -n "$MISSING" ]; then
+        echo "ERROR: missing or empty CI/CD variable(s):$MISSING"
+        echo "Set them in Settings -> CI/CD -> Variables."
+        echo "If they are already set, check that they are not marked 'Protected'"
+        echo "while this pipeline runs on an unprotected branch ($CI_COMMIT_REF_NAME)."
+        exit 1
+      fi
+
       # Configure git
       git config --global user.email "${GITLAB_USER_EMAIL:-$GITLAB_USER_ID+$GITLAB_USER_LOGIN@users.noreply.gitlab.com}"
       git config --global user.name "${GITLAB_USER_NAME:-$GITLAB_USER_LOGIN}"
@@ -51,8 +64,8 @@ export_and_create_mr:
       
       # Install Descope CLI
       mkdir -p /etc/apt/keyrings
-      gpg --no-default-keyring --keyring /etc/apt/keyrings/descope.gpg --keyserver keyserver.ubuntu.com --recv-keys e8365d8513142909
-      echo "deb [signed-by=/etc/apt/keyrings/descope.gpg] https://descope.github.io/packages stable main" | tee /etc/apt/sources.list.d/descope.list
+      curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xe8365d8513142909" -o /etc/apt/keyrings/descope.asc
+      echo "deb [signed-by=/etc/apt/keyrings/descope.asc] https://descope.github.io/packages stable main" | tee /etc/apt/sources.list.d/descope.list
       apt-get update
       apt-get install -y descope
       
@@ -118,20 +131,40 @@ export_and_create_mr:
 
 validate_and_deploy:
   stage: deploy_to_production
-  image: ubuntu:latest
+  # Pinned deliberately: 'ubuntu:latest' moves between LTS releases and has
+  # broken this pipeline before (24.04 removed apt-key). Bump this on purpose.
+  image: ubuntu:24.04
   before_script:
     # Install Descope CLI
-    - apt-get update && apt-get install -y curl jq gnupg git
+    - apt-get update && apt-get install -y curl jq git
     - |
       mkdir -p /etc/apt/keyrings
-      gpg --no-default-keyring --keyring /etc/apt/keyrings/descope.gpg --keyserver keyserver.ubuntu.com --recv-keys e8365d8513142909
-      echo "deb [signed-by=/etc/apt/keyrings/descope.gpg] https://descope.github.io/packages stable main" | tee /etc/apt/sources.list.d/descope.list
+      curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xe8365d8513142909" -o /etc/apt/keyrings/descope.asc
+      echo "deb [signed-by=/etc/apt/keyrings/descope.asc] https://descope.github.io/packages stable main" | tee /etc/apt/sources.list.d/descope.list
       apt-get update
       apt-get install -y descope
   script:
     - |
+      # Fail fast with a clear message if a required variable is missing or empty.
+      # The usual cause is a "Protected" CI/CD variable on an unprotected branch,
+      # which GitLab silently omits from the job environment.
+      MISSING=""
+      for VAR in MANAGEMENT_KEY PRODUCTION_PROJECT_ID; do
+        eval "VALUE=\${$VAR:-}"
+        if [ -z "$VALUE" ]; then
+          MISSING="$MISSING $VAR"
+        fi
+      done
+      if [ -n "$MISSING" ]; then
+        echo "ERROR: missing or empty CI/CD variable(s):$MISSING"
+        echo "Set them in Settings -> CI/CD -> Variables."
+        echo "If they are already set, check that they are not marked 'Protected'"
+        echo "while this pipeline runs on an unprotected branch ($CI_COMMIT_REF_NAME)."
+        exit 1
+      fi
+
       echo "=== Checking for meaningful ProjectSnapshot changes ==="
-      
+
       # Check if ProjectSnapshot directory exists
       if [ ! -d "$FILES_PATH" ]; then
         echo "No ProjectSnapshot directory found - skipping deployment"
@@ -141,35 +174,44 @@ validate_and_deploy:
       echo "Current commit: $CI_COMMIT_SHA"
       echo "Commit message: $CI_COMMIT_MESSAGE"
       
-      # Get the previous commit (before this merge)
-      PREVIOUS_COMMIT=$(git rev-parse HEAD~1)
-      echo "Previous commit: $PREVIOUS_COMMIT"
-      
-      # Check if there are actual content differences in ProjectSnapshot between commits
-      if git diff --quiet $PREVIOUS_COMMIT HEAD -- "$FILES_PATH"; then
-        echo "No actual content changes detected in ProjectSnapshot between commits"
-        echo "Checking if this might be a revert or identical content..."
-        
-        # Show what files were touched (even if content is same)
-        TOUCHED_FILES=$(git diff --name-only $PREVIOUS_COMMIT HEAD -- "$FILES_PATH")
-        if [ -n "$TOUCHED_FILES" ]; then
-          echo "Files were touched but content is identical:"
-          echo "$TOUCHED_FILES"
-          echo "This appears to be a revert or duplicate change - skipping deployment"
-        else
-          echo "No files in ProjectSnapshot were modified at all"
-        fi
-        
-        exit 0
+      # Get the previous commit (before this merge). GitLab clones shallowly by
+      # default (GIT_DEPTH), so HEAD~1 is not guaranteed to be present.
+      if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+        git fetch --deepen=1 || true
       fi
-      
-      echo "=== Meaningful ProjectSnapshot changes detected ==="
-      echo "Files with actual content changes:"
-      git diff --name-only $PREVIOUS_COMMIT HEAD -- "$FILES_PATH"
-      
-      echo "=== Summary of changes ==="
-      git diff --stat $PREVIOUS_COMMIT HEAD -- "$FILES_PATH"
-      
+
+      if PREVIOUS_COMMIT=$(git rev-parse --verify -q HEAD~1); then
+        echo "Previous commit: $PREVIOUS_COMMIT"
+
+        # Check if there are actual content differences in ProjectSnapshot between commits
+        if git diff --quiet $PREVIOUS_COMMIT HEAD -- "$FILES_PATH"; then
+          echo "No actual content changes detected in ProjectSnapshot between commits"
+          echo "Checking if this might be a revert or identical content..."
+
+          # Show what files were touched (even if content is same)
+          TOUCHED_FILES=$(git diff --name-only $PREVIOUS_COMMIT HEAD -- "$FILES_PATH")
+          if [ -n "$TOUCHED_FILES" ]; then
+            echo "Files were touched but content is identical:"
+            echo "$TOUCHED_FILES"
+            echo "This appears to be a revert or duplicate change - skipping deployment"
+          else
+            echo "No files in ProjectSnapshot were modified at all"
+          fi
+
+          exit 0
+        fi
+
+        echo "=== Meaningful ProjectSnapshot changes detected ==="
+        echo "Files with actual content changes:"
+        git diff --name-only $PREVIOUS_COMMIT HEAD -- "$FILES_PATH"
+
+        echo "=== Summary of changes ==="
+        git diff --stat $PREVIOUS_COMMIT HEAD -- "$FILES_PATH"
+      else
+        echo "No previous commit available (initial commit or shallow clone)"
+        echo "Cannot diff - proceeding with deployment"
+      fi
+
       echo "=== Validating Snapshot ==="
       export DESCOPE_MANAGEMENT_KEY=$MANAGEMENT_KEY
       # DESCOPE_BASE_URL, if set as a CI/CD variable, is already in the job env
