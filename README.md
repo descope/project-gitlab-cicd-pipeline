@@ -35,7 +35,8 @@ You can use this pipeline to:
 The pipeline needs access tokens and project IDs to work with both GitLab and Descope APIs.
 
 1. Create a new GitLab project.
-2. Create a **Project Access Token** (preferred) in **Settings → Access Tokens** or **Personal Access Token** in **User Settings → Access Tokens** with `write_repository` and `api` scopes.
+2. Create a **Project Access Token** (preferred) in **Settings → Access Tokens** or **Personal Access Token** in **User Settings → Access Tokens** with the `api`, `read_repository`, and `write_repository` scopes.
+   - The token must also be given the **Developer** role (or higher).
 3. In your project's **Settings → CI/CD → Variables**, add these variables:
    - `GITLAB_PUSH_TOKEN` - Your Personal Access Token
    - `MANAGEMENT_KEY` - Your Descope management key
